@@ -1,4 +1,4 @@
-//@Daniil Okrug
+//@Dmitriy
 #include <unistd.h>
 #include <limits.h>
 #include <string.h>
