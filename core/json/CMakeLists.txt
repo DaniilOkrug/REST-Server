@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 2.6)
+project (ngrestjson CXX)
+
+set (CMAKE_MACOSX_RPATH 1)
+
+set (PROJECT_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+FILE(GLOB NGRESTJSON_SOURCES ${PROJECT_SOURCE_DIR}/*.cpp)
+FILE(GLOB NGRESTJSON_HEADERS ${PROJECT_SOURCE_DIR}/*.h)
+
+file(COPY ${NGRESTJSON_HEADERS} DESTINATION ${PROJECT_INCLUDE_DIR}/ngrest/json/)
+
+add_library(ngrestjson SHARED ${NGRESTJSON_SOURCES})
+
+target_link_libraries(ngrestjson ngrestutils ngrestcommon)

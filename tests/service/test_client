@@ -1,0 +1,192 @@
+#!/bin/bash
+
+if curl --version >/dev/null; then :;
+else
+    echo "CURL is not installed. Cannot continue" >&2
+    exit 1
+fi
+
+baseurl=${1:-http://localhost:9098/ngrest/test/}
+
+# [method ]path[ request body]|expected response
+tests=(
+  'get|{"result":true}'
+  'echoSync?value=test|{"resultValue":"You said test"}'
+  'echoASync?value=test|{"result":"You said test"}'
+  'add?a=1&b=2|{"result":3}'
+  'set?val=true|'
+  'notify|'
+  'PUT theTest {"arg":{"a":1,"b":"test","testEnum":"Some","n":{"b":true},"ls":["asd","qwe","3"]}}|{"result":{"a":1,"b":"test","testEnum":"Some","n":{"b":true},"ls":["asd","qwe","3"]}}'
+
+  'templListStr?arg=%5B%22a%22%2C%221%22%2C%22test%22%5D|{"result":["a","1","test"]}'
+  'templList?arg=%5B1,2,100%5D|{"result":[1,2,100]}'
+  'templVector?arg=%5B1,2,100%5D|{"result":[1,2,100]}'
+  'templListOfStruct?arg=%5B%5D|{"result":[]}' # empty
+   # one element
+  'templListOfStruct?arg=%5B%7B%22a%22%3A1%2C%22b%22%3A%22test%22%2C%22testEnum%22%3A%22Some%22%2C%22n%22%3A%7B%22b%22%3Atrue%7D%2C%22ls%22%3A%5B%22asd%22%2C%22qwe%22%2C%223%22%5D%7D%5D|{"result":[{"a":1,"b":"test","testEnum":"Some","n":{"b":true},"ls":["asd","qwe","3"]}]}'
+  'templListOfTypedef?arg=%5B%7B%22a%22%3A1%2C%22b%22%3A%22test%22%2C%22testEnum%22%3A%22Some%22%2C%22n%22%3A%7B%22b%22%3Atrue%7D%2C%22ls%22%3A%5B%22asd%22%2C%22qwe%22%2C%223%22%5D%7D%5D|{"result":[{"a":1,"b":"test","testEnum":"Some","n":{"b":true},"ls":["asd","qwe","3"]}]}'
+  'templListOfTypedefList?arg=%5B%22a%22%2C%221%22%2C%22b%22%2C%22test%22%5D|{"result":["a","1","b","test"]}'
+
+
+  'templListList?arg=%5B%5B1,3,5%5D%5D|{"result":[[1,3,5]]}'
+  'templListListString?arg=%5B%5B%221,3%22,%225%22%5D%5D|{"result":[["1,3","5"]]}'
+  'templListListStruct?arg=%5B%5B%7B%22a%22%3A1%2C%22b%22%3A%22test%22%2C%22testEnum%22%3A%22Some%22%2C%22n%22%3A%7B%22b%22%3Atrue%7D%2C%22ls%22%3A%5B%22asd%22%2C%22qwe%22%2C%223%22%5D%7D%5D%5D|{"result":[[{"a":1,"b":"test","testEnum":"Some","n":{"b":true},"ls":["asd","qwe","3"]}]]}'
+  'templListListTypedef?arg=%5B%5B%7B%22a%22%3A1%2C%22b%22%3A%22test%22%2C%22testEnum%22%3A%22Some%22%2C%22n%22%3A%7B%22b%22%3Atrue%7D%2C%22ls%22%3A%5B%22asd%22%2C%22qwe%22%2C%223%22%5D%7D%5D%5D|{"result":[[{"a":1,"b":"test","testEnum":"Some","n":{"b":true},"ls":["asd","qwe","3"]}]]}'
+  'templListListList?arg=%5B%5B%5B1,3,5%5D%5D%5D|{"result":[[[1,3,5]]]}'
+
+  'templMapInt?arg=%7B%221%22%3A%22one%22%2C%222%22%3A%22two%22%7D|{"result":{"1":"one","2":"two"}}'
+  'templMapEnum?arg=%7B%22One%22%3A%22one%22%2C%22Two%22%3A%22two%22%7D|{"result":{"One":"one","Two":"two"}}'
+  'templMapStr?arg=%7B%22One%22%3A%22one%22%2C%22Two%22%3A%22two%22%7D|{"result":{"One":"one","Two":"two"}}'
+  'templMapStrMapStrStr?arg=%7B%22a%22%3A%7B%22q%22%3A%22w%201%22%2C%22w%22%3A%222%22%7D%7D|{"result":{"a":{"q":"w 1","w":"2"}}}'
+
+  'testTypedef?arg=%7B%22One%22%3A%22one%22%2C%22Two%22%3A%22two%22%7D|{"result":{"One":"one","Two":"two"}}'
+  'testEnum?arg=%22One%22|{"result":"One"}'
+  'testNestedEnum?arg=%22Values%22|{"result":"Values"}'
+  'testNestedStruct?arg=%7B%22b%22%3Atrue%7D|{"result":{"b":true}}'
+
+  # nullable
+  'ptrInt?arg=null|{"result":null}'
+  'ptrInt?arg=0|{"result":0}'
+  'ptrInt?arg=12|{"result":12}'
+  'ptrIntConst?arg=null|{"result":null}'
+  'ptrIntConst?arg=0|{"result":0}'
+
+  'ptrString?arg=null|{"result":null}'
+  'ptrString?arg=0|{"result":"0"}'
+  'ptrString?arg=test%20test|{"result":"test test"}'
+  'ptrString?arg="test%20test"|{"result":"test test"}'
+  'ptrString?arg="%7Btest%20test%7D"|{"result":"{test test}"}'
+
+  'ptrEnum?arg=null|{"result":null}'
+  'ptrEnum?arg=Two|{"result":"Two"}'
+  'ptrEnum?arg="Two"|{"result":"Two"}'
+
+  'ptrStruct?arg=null|{"result":null}'
+  'ptrStruct?arg=%7B%22a%22%3A1%2C%22b%22%3A%22test%22%2C%22testEnum%22%3A%22Some%22%2C%22n%22%3A%7B%22b%22%3Atrue%7D%2C%22ls%22%3A%5B%22asd%22%2C%22qwe%22%2C%223%22%5D%7D|{"result":{"a":1,"b":"test","testEnum":"Some","n":{"b":true},"ls":["asd","qwe","3"]}}'
+
+  'ptrStructList?arg=null|{"result":null}'
+  'ptrStructList?arg=%5B%7B%22a%22%3A1%2C%22b%22%3A%22test%22%2C%22testEnum%22%3A%22Some%22%2C%22n%22%3A%7B%22b%22%3Atrue%7D%2C%22ls%22%3A%5B%22asd%22%2C%22qwe%22%2C%223%22%5D%7D%5D|{"result":[{"a":1,"b":"test","testEnum":"Some","n":{"b":true},"ls":["asd","qwe","3"]}]}'
+
+  'ptrNull|{"result":{"intValue":null,"enumValue":null,"strValue":null,"structValue":null,"listValue":null,"mapValue":null}}'
+  'ptrNotNull|{"result":{"intValue":1,"enumValue":"Two","strValue":"Hello!","structValue":{"a":3,"b":"four","testEnum":"Here","n":{"b":true},"ls":[]},"listValue":["aaa","bbb","ccc"],"mapValue":{"1":"qqq","2":"www"}}}'
+
+  'ptrTest?arg=%7B%22intValue%22%3Anull%2C%22enumValue%22%3Anull%2C%22strValue%22%3Anull%2C%22structValue%22%3Anull%2C%22listValue%22%3Anull%2C%22mapValue%22%3Anull%7D|{"result":{"intValue":null,"enumValue":null,"strValue":null,"structValue":null,"listValue":null,"mapValue":null}}'
+
+  'ptrTestNull?arg=null|{"result":null}'
+  'ptrTestNull?arg=%7B%22intValue%22%3Anull%2C%22enumValue%22%3Anull%2C%22strValue%22%3Anull%2C%22structValue%22%3Anull%2C%22listValue%22%3Anull%2C%22mapValue%22%3Anull%7D|{"result":{"intValue":null,"enumValue":null,"strValue":null,"structValue":null,"listValue":null,"mapValue":null}}'
+
+  # inline result element
+
+  'getInline|true'
+  'echoSyncInline?value=test|"You said test"'
+  'addInline?a=1&b=2|3'
+  'notifyInline|'
+  'PUT theTestInline {"arg":{"a":1,"b":"test","testEnum":"Some","n":{"b":true},"ls":["asd","qwe","3"]}}|{"a":1,"b":"test","testEnum":"Some","n":{"b":true},"ls":["asd","qwe","3"]}'
+
+  'templListStrInline?arg=%5B%22a%22%2C%221%22%2C%22test%22%5D|["a","1","test"]'
+  'templVectorInline?arg=%5B1,2,100%5D|[1,2,100]'
+  'templListOfTypedefListInline?arg=%5B%22a%22%2C%221%22%2C%22b%22%2C%22test%22%5D|["a","1","b","test"]'
+
+  'templListListInline?arg=%5B%5B1,3,5%5D%5D|[[1,3,5]]'
+
+  'templMapIntInline?arg=%7B%221%22%3A%22one%22%2C%222%22%3A%22two%22%7D|{"1":"one","2":"two"}'
+
+  'testTypedefInline?arg=%7B%22One%22%3A%22one%22%2C%22Two%22%3A%22two%22%7D|{"One":"one","Two":"two"}'
+  'testEnumInline?arg=%22One%22|"One"'
+  'testNestedEnumInline?arg=%22Values%22|"Values"'
+  'testNestedStructInline?arg=%7B%22b%22%3Atrue%7D|{"b":true}'
+
+  # nullable
+  'ptrIntInline?arg=null|' # null response = empty response
+  'ptrIntInline?arg=0|0'
+  'ptrIntInline?arg=12|12'
+
+  # filters
+  # test throw
+  '?x-test-header-throw:1 echo?value=test|Throw found in headers'
+  '?x-test-header-throw2:1 echo?value=test|Throw2 found in headers'
+  '?x-test-predispatch-throw:1 echo?value=test|Throw found in headers'
+  '?x-test-preinvoke-throw:1 echo?value=test|Throw found in headers'
+  '?x-test-postdispatch-throw:1 echo?value=test|Throw found in headers'
+  '?x-test-presend-throw:1 echo?value=test|Throw found in headers'
+
+#  # test filtering
+  '?x-test-header:1 echo?value=00|{"result":"_ZERO__ZERO_"}'
+  '?x-test-predispatch:1 echo?value=aa1aa|{"result":"aa_ONE_aa"}'
+  '?x-test-predispatch:1 POST echo {"value":"aa1aa"}|{"result":"aa_ONE_aa"}'
+  '?x-test-preinvoke:1 echo?value=aa2aa|{"result":"aa33aa"}'
+  '?x-test-preinvoke:1 POST echo {"value":"aa2aa"}|{"result":"aa33aa"}'
+  '?x-test-postdispatch:1 echo?value=a3a|{"result":"a44a"}'
+  '?x-test-presend:1 echo?value=a4a|{"result":"a*a"}'
+
+  # chain filters: 0 -> _ZERO_, 1 -> _ONE_, 2 -> 33, 3 -> 44, 4-> *
+  '?x-test-header:1 ?x-test-predispatch:1 ?x-test-preinvoke:1 ?x-test-preinvoke:1 ?x-test-postdispatch:1 ?x-test-presend:1 echo?value=012345|{"result":"_ZERO__ONE_*4444445"}'
+)
+
+passed=0
+failed=0
+for t in "${tests[@]}"
+do
+  req="${t%%|*}"
+  expect="${t##*|}"
+  reqBody=
+  headers=
+  if [[ "$req" =~ " " ]]
+  then
+    while [ "${req::1}" == "?" ]
+    do
+      header=${req%% *}
+      headers+=" -H ${header:1}"
+      req="${req#* }"
+    done
+  fi
+
+  if [[ "$req" =~ " " ]]
+  then
+    method="${req%% *}"
+    req="${req#* }"
+    if [[ "$req" =~ " " ]]
+    then
+      reqBody="${req#* }"
+      req="${req%% *}"
+    fi
+  else
+    method=GET
+  fi
+  url="$baseurl$req"
+  echo -n "testing $method $req "
+  if [ -n "$reqBody" ]
+  then
+    res=$(curl -s -S -X $method -d @- $headers -H "Content-Type:application/json" "$url" <<< "$reqBody")
+  else
+    res=$(curl -s -S -X $method $headers "$url")
+  fi
+
+  ret=$?
+  if [ $ret -ne 0 ]
+  then
+    echo -e "\e[31;1mFAILED IN INVOKE\e[0m\n"
+    echo -e "\e[31;1mFAILED URL: $url\e[0m\n"
+    ((++failed))
+  else
+    if [ "$res" != "$expect" ]
+    then
+      echo -e "\e[31;1mFAILED\n---- EXPECTED: ----\n$expect\n---- RECEIVED: ----\n$res\n----\n\e[0m\n"
+      echo -e "\e[31;1mFAILED URL: $url\e[0m\n"
+      ((++failed))
+    else
+      echo "OK"
+      ((++passed))
+    fi
+  fi
+done
+
+if [ $failed -eq 0 ]
+then
+  echo -e "\nAll $passed tests passed"
+  exit 0
+else
+  echo -e "\nTests passed: $passed"
+  echo -e "\e[31;1mTests failed: $failed \e[0m"
+  exit 1
+fi

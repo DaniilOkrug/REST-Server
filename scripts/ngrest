@@ -1,0 +1,1207 @@
+#!/usr/bin/env bash
+
+set -eu
+
+# detect OS
+OS=
+case $(uname -s) in
+  MSYS*|MINGW*)
+    OS=MSYS
+    ;;
+  Linux)
+    OS=Linux
+    ;;
+  Darwin)
+    OS=Darwin
+    export DISABLE_WATCHER=1
+    ;;
+  *)
+    echo "This OS is not supported: $(uname -s)" >&2
+    exit 1
+esac
+
+if [ $OS = MSYS ]
+then
+  export NGREST_ROOT=$(cd "$APPDATA\\ngrest"; pwd)
+else
+  export NGREST_ROOT=~/.ngrest
+fi
+export NGREST_HOME_SRC=$NGREST_ROOT/ngrest
+export NGREST_PACKAGES_DIR=$NGREST_ROOT/packages
+
+export NGREST_HOME=$NGREST_HOME_SRC-build/deploy
+export PATH=$PATH:$NGREST_HOME/bin
+export NGREST_EXT_LIBS=
+export NGREST_EXT_INCLUDES=
+nl="
+"
+# extensions are supported only under bash version >= 4
+declare -A extensions 2>/dev/null && ENABLE_EXTENSIONS=1 || ENABLE_EXTENSIONS=0
+
+if [ -f .ngrest/packages ]
+then
+  added_packages=($(<.ngrest/packages))
+  if [ -z "${added_packages:-}" ]
+  then
+    # workaround over unbound variable generated with empty list: added_packages=()
+    added_packages=
+  fi
+else
+  added_packages=
+fi
+
+if [ -e "$NGREST_PACKAGES_DIR/packages" ]
+then
+  # loentar/ngrest-db:0.1
+  packages=($(<"$NGREST_PACKAGES_DIR/packages"))
+  for p in ${packages[@]}
+  do
+    package=${p%%:*}
+    if [ -e "$NGREST_PACKAGES_DIR/$package/scripts/ngrest-inject" ]
+    then
+        [[ " ${added_packages[@]} " =~ " $package " ]] && active=active || active=
+        . "$NGREST_PACKAGES_DIR/$package/scripts/ngrest-inject"
+    fi
+  done
+else
+  packages=
+fi
+
+
+if [ $OS = MSYS -o $OS = Darwin ]
+then
+  mktemp() {
+    n=/tmp/$(date +%Y%m%d%H%M%S)
+    mkdir "$n"
+    echo "$n"
+  }
+
+  fakeroot() {
+    $1
+  }
+fi
+
+help_create() {
+  cat >&2 << EOF
+Usage: ngrest create [<project_name>] <service_name> [<service_name>...]
+
+Create a new project with one or more services.
+Service name may optionally contain package name.
+
+
+Example 1. Create service calculator which is bound to "/calculator" resource:
+
+  ngrest create calculator
+
+
+Example 2. Create service calculator which is bound to "/ngrest/example/calculator" resource:
+
+  ngrest create ngrest.example.calculator
+
+Example 3. Create service calculator which is bound to "/ngrest/example/calculator" resource and set project name to "calc":
+
+  ngrest create calc ngrest.example.calculator
+
+EOF
+}
+
+help_run() {
+  cat >&2 << EOF
+Usage: ngrest [run]
+
+Build and run your project in local deployment mode.
+
+Must start in project's dir, i.e. current directory must contain '.ngrest' subdirectory and service(s) subdirectories.
+
+There a set of environment variables to control the build process and the server:
+
+  NGREST_SERVER_PORT       Sets port which server should listen for incoming connections (default: 9098).
+
+  NGREST_SERVER_IP         Sets IPv4 or IPv6 address which server should listen for incoming connections (default - all available).
+
+  NGREST_LOG_LEVEL         Sets log level. Supported values are:
+                              ALERT CRIT ERROR WARNING NOTICE INFO DEBUG VERBOSE TRACE
+
+  NGREST_LOG_VERBOSITY     Sets log verbosity. This variable is a combination of values such as:
+                              TEXT LEVEL FILELINE FUNCTION DATETIME DEFAULT ALL
+
+  CMAKE_FLAGS              Sets CMAKE arguments used to build your project.
+
+  MAKE_FLAGS               Sets MAKE arguments used to build your project.
+
+
+Example 1. Start your project enabling all log messages:
+
+  NGREST_LOG_LEVEL=TRACE NGREST_LOG_VERBOSITY=ALL ngrest
+
+Example 2. Start your project and set server's port to 9090:
+
+  NGREST_SERVER_PORT=9090 ngrest
+
+EOF
+}
+
+help_build() {
+  cat >&2 << EOF
+Usage: ngrest build
+
+Build current project and create service binaries in '.ngrest/local/build/services'.
+
+EOF
+}
+
+help_clean() {
+  cat >&2 << EOF
+Usage: ngrest clean
+
+Clean build and program caches.
+Useful when you change CMAKE/MAKE flags or prepairing to create source tarball.
+
+EOF
+}
+
+help_upgrade() {
+  cat >&2 << EOF
+Usage: ngrest upgrade [<commit_hash>]
+
+Upgrades ngrest to the latest available version on github. Upgrades to specific commit if provided.
+
+Example 1. Upgrade to latest available version:
+
+  ngrest upgrade
+
+Example 2. Upgrade to commit 2092ea0...:
+
+  ngrest upgrade 2092ea0
+
+EOF
+}
+
+help_bundle_server() {
+  cat >&2 << EOF
+Usage: ngrest bundle-server [<archive_name_noext>]
+
+Create ngrest server bundle to install it to another host.
+Uses 'archive_name_noext' as filename for output archive.
+
+EOF
+}
+
+help_deploy_server() {
+  cat >&2 << EOF
+Usage: ngrest deploy-server [user@]host [path]
+
+Install local version of ngrest server to remote host.
+By default path = /opt. This will deploy ngrest server into /opt/ngrest
+
+Note: Before deploying you must make parent directory writable (sudo chmod 777 /opt)
+    or create path with writable permission:
+      sudo mkdir /opt/ngrest
+      sudo chown user:user /opt/ngrest
+
+Example:
+
+  ngrest deploy-server 192.168.0.1
+
+EOF
+}
+
+help_bundle() {
+  cat >&2 << EOF
+Usage: ngrest bundle [<archive_name_noext>]
+
+Create bundle of the current project to install it to another host.
+Uses 'archive_name_noext' as filename for output archive.
+
+EOF
+}
+
+help_deploy() {
+  cat >&2 << EOF
+Usage: ngrest deploy [user@]host [server_path]
+
+Deploy local version of the current project to remote host.
+ngrest server must be installed on server_path.
+By default server_path = /opt/ngrest.
+
+Example:
+
+  ngrest deploy 192.168.0.1
+
+EOF
+}
+
+help_add() {
+  cat >&2 << EOF
+Usage: ngrest add <package_name> [args]
+
+Add a new ngrest extension package to the current project.
+
+'package_name' is formed from github url removing "http://github.com/".
+'args' are arguments passed to package.
+
+For example to add "https://github.com/loentar/ngrest-db" package with SQLite driver use:
+
+  ngrest add loentar/ngrest-db sqlite
+
+EOF
+}
+
+
+help_remove() {
+  cat >&2 << EOF
+Usage: ngrest remove <package_name>
+
+Remove a package from current project.
+
+'package_name' is the same as in "ngrest install".
+
+EOF
+}
+
+help_packages() {
+  cat >&2 << EOF
+Usage: ngrest packages
+
+List packages used by current project. Packages are printed with version numbers.
+
+EOF
+}
+
+help_upgrade_package() {
+  cat >&2 << EOF
+Usage: ngrest upgrade-package [<package_name> [<package_version>]] | [--all]
+
+Upgrade selected package to specific version.
+If <package_version> is omitted package will be upgraded to the last available version.
+if argument --all is passed, all packages will be upgraded to the last available version.
+
+EOF
+}
+
+help() {
+  case "${1:-}" in
+  create)
+    help_create
+    ;;
+
+  run)
+    help_run
+    ;;
+
+  build)
+    help_build
+    ;;
+
+  clean)
+    help_clean
+    ;;
+
+  add)
+    help_add
+    ;;
+
+  remove)
+    help_remove
+    ;;
+
+  packages)
+    help_packages
+    ;;
+
+  upgrade-package)
+    help_upgrade_package
+    ;;
+
+  bundle-server)
+    help_bundle_server
+    ;;
+
+  deploy-server)
+    help_deploy_server
+    ;;
+
+  bundle)
+    help_bundle
+    ;;
+
+  deploy)
+    help_deploy
+    ;;
+
+  upgrade)
+    help_upgrade
+    ;;
+
+  *)
+    extensions_help=
+    if [ $ENABLE_EXTENSIONS -eq 1 ]
+    then
+      if [ -n "${1:-}" ]
+      then
+        desc="${extensions[$1]:-}"
+        if [ -n "$desc" ]
+        then
+          echo "${desc#*$nl}" >&2
+          return
+        fi
+      fi
+
+      for key in ${!extensions[@]}
+      do
+        desc="${extensions[$key]}"
+        while [ ${#key} -lt 16 ]; do key+=" "; done
+        extensions_help+="  $key ${desc%%$nl*}$nl"
+      done
+    fi
+
+
+    cat >&2 << EOF
+Usage: ngrest [help] [<command>] [<arguments>]
+
+Commands:
+  create           Create a new project.
+  run              (default) Build and run current project in local deployment mode.
+  build            Build current project.
+  clean            Clean build and program cache.
+  add              Add a new package into current project.
+  remove           Remove a package from current project.
+  packages         List packages used by current project.
+  upgrade          Upgrade ngrest to the latest available version.
+  upgrade-package  Upgrade packages to the latest available version.
+  bundle-server    Create ngrest server bundle to install it to another machine.
+  deploy-server    Deploy local version of ngrest server to remote host.
+  bundle           Create bundle of the current project to install it to another host.
+  deploy           Deploy local version of the current project to remote host.
+$extensions_help\
+  help             Display help for the command.
+
+EOF
+    ;;
+  esac
+}
+
+create() {
+  CODEGEN_OPTIONS=
+  if [ "x${1::1}" = "x-" ]
+  then
+    case "${1:1:1}" in
+      d)
+        OPT=${1:2}
+        if [ -z "$OPT" ]
+        then
+          if [ -z "${2:-}" ]
+          then
+            echo "Missing option for -d" >&2
+            exit 1;
+          fi
+          OPT=$2
+          shift
+        fi
+        CODEGEN_OPTIONS+=",$OPT"
+        ;;
+    esac
+    shift
+  fi
+
+  if [ -z "$1" ]
+  then
+    echo "Project name omitted" >&2
+    help_create
+    exit 1
+  fi
+
+  if [ -z "${2:-}" ]
+  then
+    # generate project name from service name
+    SERVICE_NAME=${1:-}
+    PROJECT_NAME=${SERVICE_NAME##*\.}
+    # bash 3.1 compat
+    PROJECT_NAME=$(tr '[:upper:]' '[:lower:]' <<< "$PROJECT_NAME")
+    shift
+  else
+    PROJECT_NAME=${1:-}
+    SERVICE_NAME=${2:-}
+    shift
+    shift
+  fi
+
+  if [ -z "$PROJECT_NAME" ]
+  then
+    echo "Project name cannot be empty" >&2
+    help_create
+    exit 1
+  fi
+
+  if [ -d "$PROJECT_NAME" ]
+  then
+    echo "Failed to create project [$PROJECT_NAME]: Another directory with the same name is already exist in current directory" >&2
+    exit 1
+  fi
+
+  if [ -z "$SERVICE_NAME" ]
+  then
+    echo "Service name cannot be empty" >&2
+    help_create
+    exit 1
+  fi
+
+  SERVICES=
+
+  while [ -n "$SERVICE_NAME" ]
+  do
+    # bash 3.1 compat
+    TEST_NAME=$(sed '/^\([a-z][a-z0-9_]*\.\)*[a-zA-Z]\([a-zA-Z_0-9]*\)$/!d' <<< "$SERVICE_NAME")
+    if [ -z "$TEST_NAME" ]
+    then
+      echo "Invalid service name: [$SERVICE_NAME]" >&2
+      echo "Service name must only contain digits, letters, underscore and dot symbol and must start with a letter" >&2
+      help_create
+      exit 1
+    fi
+
+    SERVICES+="$SERVICE_NAME "
+
+    SERVICE_NAME=${1:-}
+    [ -n "$SERVICE_NAME" ] && shift
+  done
+  SERVICES=${SERVICES% }
+
+  echo "Creating project [$PROJECT_NAME] with services [$SERVICES]..."
+  mkdir "$PROJECT_NAME" || (
+    echo "Failed to create directory for project [$PROJECT_NAME]" >&2
+    exit 1
+  )
+  cd "$PROJECT_NAME"
+  mkdir -p .ngrest/local
+  ngrestcg -t project -n "$PROJECT_NAME" -d services="$SERVICES""$CODEGEN_OPTIONS" >.ngrest/local/codegen.log || (
+    echo "Failed to create project [$PROJECT_NAME] with services [$SERVICES]" >&2
+    cat .ngrest/local/codegen.log
+    cd -
+    rm -rf "$PROJECT_NAME" 2>/dev/null
+    exit 1
+  )
+
+  echo "$PROJECT_NAME" >.ngrest/name
+  echo "${SERVICES// /$nl}" >.ngrest/services
+  cat >.gitignore <<EOF
+.ngrest/local
+EOF
+
+  cat <<EOF
+
+
+Your new project [$PROJECT_NAME] has been created.
+
+You can start it by typing from "$PROJECT_NAME" directory:
+
+  ngrest
+
+EOF
+}
+
+build() {
+  check_get_name
+  BUILD_DIR=$PROJECT_DIR/.ngrest/local/build
+
+  mkdir -p "$BUILD_DIR"
+  cd "$BUILD_DIR"
+
+  [ -e .ngrest_version ] && BUILT_WITH_VERSION=$(<.ngrest_version) || BUILT_WITH_VERSION=
+  CURRENT_VERSION=$(git -C "$NGREST_HOME_SRC" rev-parse HEAD)
+  if [ "$BUILT_WITH_VERSION" != "$CURRENT_VERSION" -a -n "$BUILT_WITH_VERSION" ]
+  then
+    echo "Cleaning build $(<$PROJECT_DIR/.ngrest/name) due to ngrest upgrade..."
+    rm -rf ../build/* # be sure to do not remove something wrong
+  fi
+
+  echo "Building project $(<$PROJECT_DIR/.ngrest/name)..."
+  CMAKE_FLAGS=${CMAKE_FLAGS:-'-DCMAKE_BUILD_TYPE=DEBUG'}
+
+  if [ $OS = MSYS ]
+  then
+    CMAKE_FLAGS+=" '-GUnix Makefiles' -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER=gcc"
+  fi
+
+  cmake $CMAKE_FLAGS $PROJECT_DIR >cmake.log || return $?
+
+  make ${MAKE_FLAGS:-} >make.log || return $?
+  mkdir -p services
+  rm -f services/*
+  cp $PWD/deploy/share/ngrest/services/* services/
+
+  [ "$BUILT_WITH_VERSION" = "$CURRENT_VERSION" ] || echo "$CURRENT_VERSION" > .ngrest_version
+  echo "build finished."
+
+  cd "$PROJECT_DIR"
+}
+
+color() {
+  [ -n "${NO_LOG_COLOR:-}" ] || echo -en "\e[$1m"
+}
+
+start_server() {
+  CODE=0
+  rm -f core*
+  ulimit -c unlimited 2>/dev/null || true
+  ngrestserver -l "$IP" -p $PORT -s "$BUILD_DIR/services" || CODE=$?
+  if [ $CODE -eq 139 ]
+  then
+    CORE=$(find core* -type f -name 'core*' 2>/dev/null || true)
+    if [ -n "$CORE" ]
+    then
+      color "33"
+      echo -e "\n===== CORE DUMP ==========================================================="
+      gdb -batch -q -ex "bt" $NGREST_HOME/bin/ngrestserver -core $CORE 2>/dev/null | (
+        if [ -n "${NO_LOG_COLOR:-}" ]
+        then
+          cat
+        else
+          # highlight crash location
+          sed "$(echo -e '/^[ \t]*#0.*$/{N;s/^.*$/\e[4;1m&\e[22;24m/;N;:p;N;$!bp}')"
+        fi
+      ) || true
+      echo -e "===== END OF CORE DUMP ====================================================\n"
+      color "0"
+    fi
+    color "31;1"
+    echo "Server crashed. Waiting for project modifications..." >&2
+    color "0"
+  fi
+}
+
+stop_server() {
+  SERVER_PID=$(ps --no-headers --ppid $NGREST_SERVER_WATCHER_PID -o pid,comm |\
+         sed -n '/ ngrestserver/{s/^[ ]*\([0-9]\+\) .*/\1/;p}')
+  if [ -z "$SERVER_PID" ]
+  then
+    CORE=$(find core* -type f -name 'core*' 2>/dev/null || true)
+    [ -n "$CORE" ] || echo "Cannot find server's PID." >&2
+    return
+  fi
+
+  if [ -n "$SERVER_PID" ]
+  then
+    kill -INT $SERVER_PID
+    sleep 1
+    COUNT=10
+    while :
+    do
+      if kill -0 $SERVER_PID 2>/dev/null
+      then :; else
+        FINISHED=1
+        break
+      fi
+
+      ((--COUNT))
+      if [ $COUNT -eq 0 ]
+      then
+        kill -KILL $SERVER_PID
+        sleep .5
+        break
+      fi
+      sleep .5
+    done
+  fi
+}
+
+restart_on_upgrade() {
+  echo "Restarting the project due to ngrest upgrade..."
+  UPGRADE_RESTART=1
+  CHILDREN=$(ps --no-headers --ppid $$ -o pid)
+  stop_server
+  kill -TERM $CHILDREN 2>/dev/null || true
+}
+
+check_get_name() {
+  if [ ! -e .ngrest/name ]
+  then
+    cat >&2 << EOF
+run: No ngrest projects found in current directory.
+
+To create a new ngrest project:
+  ngrest create <project_name>
+
+For more help, see "ngrest help".
+EOF
+    exit 1
+  fi
+  NAME=$(<.ngrest/name)
+  PROJECT_DIR=$PWD
+}
+
+run() {
+  check_get_name
+  for added_package in ${added_packages[@]}
+  do
+    check_install_package "$added_package"
+  done
+
+  if [ -z "${NO_LOG_COLOR:-}" ]
+  then
+    export NGREST_LOG_COLOR=1
+  fi
+
+  PORT=${NGREST_SERVER_PORT:-9098}
+  IP=${NGREST_SERVER_IP:-localhost}
+  IPQ=$IP
+  [[ ! "$IPQ" =~ ":" ]] || IPQ="[$IPQ]"
+
+  build
+
+  echo -e "\nTo test your services try ngrest service tester:"
+  while read SERVICE
+  do
+    echo -n "  "
+    color "34;4;1"
+    echo "http://$IPQ:$PORT/ngrest/service/$SERVICE"
+    color "0"
+  done < $PROJECT_DIR/.ngrest/services
+
+  if [ -z "${NGREST_LOG_VERBOSITY:-}" ]
+  then
+    export NGREST_LOG_VERBOSITY="LEVEL DATETIME TEXT"
+  fi
+
+  if [ $OS = MSYS ]
+  then
+    DISABLE_WATCHER=1
+  fi
+
+  if [ -z "${DISABLE_WATCHER:-}" ]
+  then
+    # test if inotifywait is installed
+    RES=0
+    inotifywait -h >/dev/null 2>&1 || RES=$?
+    if [ $RES -eq 127 ] # command not found
+    then
+      DISABLE_WATCHER=1
+      color "33"
+      echo "Cannot find inotifywait. Starting your project without file watcher support." >&2
+      echo "Please install inotify-tools package or to suppress this warning:" >&2
+      echo "  DISABLE_WATCHER=1 ngrest" >&2
+      color "0"
+    fi
+  fi
+
+  echo -e "\nStarting your project in local deployment mode..."
+  echo -e "Press [Ctrl+C] to stop your project\n"
+  if [ -n "${DISABLE_WATCHER:-}" ]
+  then
+    start_server
+  else
+    color "32"
+    echo -e "Watching your project for modifications...\n"
+    color "0"
+
+    WAIT_FILES=${WAIT_FILES:-'(.*\.(c|cpp|h|hpp)|CMakeLists.txt)$'}
+    EXCLUDE_WAIT_FILES=${EXCLUDE_WAIT_FILES:-'.*/\..*$'}
+
+    start_server &
+    NGREST_SERVER_WATCHER_PID=$!
+
+    trap restart_on_upgrade HUP
+
+    # watcher
+    while :
+    do
+      UPGRADE_RESTART=
+      RES=0
+      FILE=$(inotifywait -q -e close_write -r "$PROJECT_DIR" --format "%w%f") || RES=$?
+      case $RES in
+        127) # command not found
+          echo "Cannot find inotifywait. Please install it or start ngrest without watcher:" >&2
+          echo "  DISABLE_WATCHER=1 ngrest" >&2
+          exit 1
+          ;;
+        130) #Ctr+C
+          exit 130
+          ;;
+      esac
+
+      if [ -z "${UPGRADE_RESTART:-}" ]
+      then
+        sleep 1
+        [[ "$FILE" =~ $WAIT_FILES ]] || continue
+        [[ ! "$FILE" =~ $EXCLUDE_WAIT_FILES ]] || continue
+
+        echo "Project files changed."
+      fi
+
+      if build
+      then :; else
+        echo "Build failed. Waiting for project modifications..."
+        echo "(Server is still running with last successful build)"
+        continue
+      fi
+
+      echo "Build successful. Restarting the server..."
+      stop_server
+      start_server &
+      NGREST_SERVER_WATCHER_PID=$!
+    done
+
+  fi
+}
+
+build_package() {
+  echo "Configuring $1 for the build..."
+  [ $OS != MSYS ] || CMAKE_FLAGS="'-GUnix Makefiles' ${CMAKE_FLAGS:-}"
+  cmake "${CMAKE_FLAGS:-}" "$2" >cmake-build.log
+  echo "Building $1. It may take few minutes..."
+  make ${MAKE_FLAGS:-} >make-build.log
+  touch .build_ok
+  echo "Build OK"
+}
+
+check_install_package() {
+
+  pkg_installed=0
+  for p in ${packages[@]}
+  do
+    if [ "${p%%:*}" == "$1" ]
+    then
+      pkg_installed=1
+    fi
+  done
+
+  PROJECT_PWD=$PWD
+
+  # package is not installed or dir does not exist
+  if [ $pkg_installed -eq 0 -o ! -e "$NGREST_PACKAGES_DIR/$1-build/.build_ok" ]
+  then
+    # clone extension's repo and build
+    color "1"
+    echo "Package $1 is not installed locally. Installing..."
+    color "0"
+    mkdir -p "$NGREST_PACKAGES_DIR"
+    cd "$NGREST_PACKAGES_DIR"
+    if [ ! -e "$1" ]
+    then
+      git clone "https://github.com/$1.git" "$1"
+    fi
+    rm -rf "$1-build"
+    mkdir -p "$1-build"
+    cd "$1-build"
+    build_package "$1" ../${1##*/}
+
+    cd "$PROJECT_PWD"
+
+    packages+=($1)
+
+    active=active
+    [ ! -e "$NGREST_PACKAGES_DIR/$1/scripts/ngrest-inject" ] || . "$NGREST_PACKAGES_DIR/$1/scripts/ngrest-inject"
+
+    echo "$1" >> "$NGREST_PACKAGES_DIR/packages"
+  elif [ "${2:-}" = upgrade ]
+  then
+    mkdir -p "$NGREST_PACKAGES_DIR"
+    cd "$NGREST_PACKAGES_DIR"
+    rm -rf "$1-build"
+    mkdir -p "$1-build"
+    cd "$1-build"
+    build_package "$1" ../${1##*/}
+  fi
+
+  cd "$PROJECT_PWD"
+}
+
+packages_list() {
+  if [ $ENABLE_EXTENSIONS -ne 1 ]
+  then
+    echo "Packages support is disabled" >&2
+    exit 2
+  fi
+
+  check_get_name
+
+  if [ -z "$added_packages" ]
+  then
+    echo "No packages added" >&2
+    exit 0
+  fi
+
+  for pkg in ${added_packages[@]}
+  do
+    echo "$pkg"
+  done
+}
+
+packages_add() {
+  if [ $ENABLE_EXTENSIONS -ne 1 ]
+  then
+    echo "Packages support is disabled" >&2
+    exit 2
+  fi
+
+  package=${1:-}
+  if [ -z "$package" ]
+  then
+    echo "Package name omitted" >&2
+    help_add
+    exit 1
+  fi
+
+  shift
+
+  for added_package in ${added_packages[@]}
+  do
+    if [ "$package" = "$added_package" ]
+    then
+      echo "Package $package is already added!" >&2
+      exit 1
+    fi
+  done
+
+  check_install_package "$package"
+
+  [ ! -e "$NGREST_PACKAGES_DIR/$package/scripts/ngrest-trigger" ] || \
+    bash "$NGREST_PACKAGES_DIR/$package/scripts/ngrest-trigger" add "$@"
+
+  echo "$package" >> .ngrest/packages
+
+  echo "Package $package has been added."
+}
+
+packages_remove() {
+  if [ $ENABLE_EXTENSIONS -ne 1 ]
+  then
+    echo "Packages support is disabled" >&2
+    exit 2
+  fi
+
+  package=${1:-}
+  if [ -z "$package" ]
+  then
+    echo "Package name omitted" >&2
+    help_remove
+    exit 1
+  fi
+
+  found=0
+  for added_package in ${added_packages[@]}
+  do
+    if [ "$package" = "$added_package" ]
+    then
+      found=1
+      break
+    fi
+  done
+
+  if [ $found -eq 0 ]
+  then
+    echo "No package $package added to current project."
+    exit 1
+  fi
+
+  [ ! -e "$NGREST_PACKAGES_DIR/$package/scripts/ngrest-trigger" ] || bash "$NGREST_PACKAGES_DIR/$package/scripts/ngrest-trigger" remove
+
+  sed -i~ "/^${package//\//\\/}\$/d" .ngrest/packages
+
+  echo "Package $package has been removed."
+}
+
+packages_upgrade_one() {
+  cd "$NGREST_PACKAGES_DIR/$1"
+
+  LAST_VERSION=$(git rev-parse HEAD)
+  [ -n "${2:-}" ] || git checkout master >/dev/null
+  RES=$(LANG=C git pull >/dev/null)
+  [ -z "${2:-}" ] || RES=$(git checkout $2 >/dev/null)
+  CURRENT_VERSION=$(git rev-parse HEAD)
+
+  cd - >/dev/null
+  if [ "$CURRENT_VERSION" = "$LAST_VERSION" -a -e "$NGREST_PACKAGES_DIR/$1-build/.build_ok" ]
+  then
+    echo "$1: No upgrades found"
+  else
+    check_install_package "$package" upgrade
+
+    [ ! -e "$NGREST_PACKAGES_DIR/$package/scripts/ngrest-trigger" ] || \
+      bash "$NGREST_PACKAGES_DIR/$package/scripts/ngrest-trigger" upgrade "$LAST_VERSION" "$CURRENT_VERSION" "$@"
+
+    echo "$1 upgraded to $CURRENT_VERSION"
+  fi
+}
+
+packages_upgrade() {
+  echo "Checking for packages to upgrade..."
+
+  if [ $ENABLE_EXTENSIONS -ne 1 ]
+  then
+    echo "Packages support is disabled" >&2
+    exit 2
+  fi
+
+  check_get_name
+
+  if [ -z "$added_packages" ]
+  then
+    echo "No packages added" >&2
+    exit 0
+  fi
+
+  if [ -z "${1:-}" ]
+  then
+    echo "Argument ommited" >&2
+    help_upgrade_package
+    exit 1
+  fi
+
+  if [ "x$1" == "x--all" ]
+  then
+    for pkg in ${added_packages[@]}
+    do
+      packages_upgrade_one $pkg
+    done
+  else
+    packages_upgrade_one "$@"
+  fi
+}
+
+
+upgrade() {
+  echo "Checking for upgrades..."
+  cd "$NGREST_HOME_SRC"
+
+  LAST_VERSION=$(git rev-parse HEAD)
+  [ -n "${1:-}" ] || git checkout master >/dev/null
+  RES=$(LANG=C git pull >/dev/null)
+  [ -z "${1:-}" ] || RES=$(git checkout $1 >/dev/null)
+  CURRENT_VERSION=$(git rev-parse HEAD)
+
+  if [ "$CURRENT_VERSION" = "$LAST_VERSION" -a -e "$NGREST_HOME/../.build_ok" ]
+  then
+    echo "No upgrades found"
+  else
+    # reading script into memory to prevent upgrade errors
+    # caused by script is changed on execution
+    INST_SCRIPT=$(<"$NGREST_HOME_SRC/scripts/inst")
+    UPGRADE=1 bash <<< "$INST_SCRIPT"
+  fi
+}
+
+check_not_mingw() {
+  if [ $OS = MSYS ]
+  then
+    echo "This command is not supported under MSYS. Sorry." >&2
+    exit 1
+  fi
+}
+
+bundle_server() {
+  check_not_mingw
+  CURRENT_VERSION=$(git -C "$NGREST_HOME_SRC" rev-parse --short HEAD)
+  OUT_FILE_BASE=${1:-$PWD/ngrest-server-bundle-$CURRENT_VERSION}
+  [ "${OUT_FILE_BASE::1}" == "/" ] || OUT_FILE_BASE=$PWD/$OUT_FILE_BASE
+  TMP_DIR=$(mktemp -d)
+  trap "rm -rf $TMP_DIR" EXIT
+  fakeroot bash << EOD
+set -eu
+mkdir $TMP_DIR/ngrest
+echo "performing ngrest server bundle..."
+cp -r $HOME/.ngrest/ngrest-build/deploy/{bin,lib,share} $TMP_DIR/ngrest
+chown -R 0:0 $TMP_DIR/ngrest
+mv $TMP_DIR/ngrest/bin/ngrestserver $TMP_DIR/ngrest/bin/ngrestserver-bin
+echo -e '#!/bin/bash\n\ncd \$(dirname \$0)\nexport LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:\$PWD/../lib\nexec ./ngrestserver-bin \$@' >$TMP_DIR/ngrest/bin/ngrestserver
+chmod 755 $TMP_DIR/ngrest/bin/ngrestserver
+rm -rf $TMP_DIR/ngrest/bin/ngrestcg $TMP_DIR/ngrest/lib/libngrestcgparser.so $TMP_DIR/ngrest/share/ngrest/codegen
+rm -f $TMP_DIR/ngrest/share/ngrest/services/{crudservice.so,echoservice.so,ngresttestservice.so}
+[ -n "${NOSTRIP:-}" ] || strip --strip-unneeded $TMP_DIR/ngrest/bin/ngrestserver-bin $TMP_DIR/ngrest/lib/*.so $TMP_DIR/ngrest/share/ngrest/services/*.so || true
+echo $CURRENT_VERSION >$TMP_DIR/ngrest/VERSION
+cp $HOME/.ngrest/ngrest/LICENSE $TMP_DIR/ngrest/
+cd $TMP_DIR
+tar Jc ngrest >ngrest.tar.xz
+cd - >/dev/null
+mv $TMP_DIR/ngrest.tar.xz $OUT_FILE_BASE.tar.xz
+[ -n "${QUIET:-}" ] || cat << EEE
+
+Created $OUT_FILE_BASE.tar.xz
+
+You can install it using:
+  tar Jxf ${OUT_FILE_BASE##*/}.tar.xz -C/opt
+
+To start ngrest server:
+  /opt/ngrest/bin/ngrestserver
+EEE
+EOD
+  rm -rf $TMP_DIR
+  trap "" EXIT
+}
+
+deploy_server() {
+  check_not_mingw
+  SERVER=${1:-}
+  SERVER_PATH=${2:-/opt}
+  if [ -z "$SERVER" ]
+  then
+    echo "host parameter is missing" >&2
+    help_deploy_server
+    exit 1
+  fi
+
+  TMP_DEPLOY_DIR=$(mktemp -d)
+  cd $TMP_DEPLOY_DIR
+  QUIET=1 bundle_server
+  BUNDLE=$OUT_FILE_BASE.tar.xz
+  BUNDLE_CONTENTS=$(base64 -w0 $BUNDLE)
+
+  echo "connecting to $SERVER..."
+  ssh -qt $SERVER /bin/bash << EOF
+set -eu
+echo "Deploying..."
+TMP_DIR=\$(mktemp -d)
+cd \$TMP_DIR
+base64 -d <<< "$BUNDLE_CONTENTS" | tar Jx -C $SERVER_PATH
+echo "deploy completed"
+EOF
+  rm -rf $TMP_DEPLOY_DIR
+}
+
+bundle() {
+  check_not_mingw
+  check_get_name
+  NGREST_VERSION=$(git -C "$NGREST_HOME_SRC" rev-parse --short HEAD)
+  OUT_FILE_BASE=${1:-$PWD/$NAME-ngrest-$NGREST_VERSION}
+  [ "${OUT_FILE_BASE::1}" == "/" ] || OUT_FILE_BASE=$PWD/$OUT_FILE_BASE
+
+  TMP_DIR=$(mktemp -d)
+  trap "rm -rf $TMP_DIR" EXIT
+
+  echo "performing $NAME bundle..."
+  fakeroot bash << EOD
+set -eu
+
+cp -Rf .ngrest/local/build/deploy/* $TMP_DIR
+chown -R 0:0 $TMP_DIR
+cd $TMP_DIR
+[ -n "${NOSTRIP:-}" ] || strip --strip-unneeded share/ngrest/services/*.so || true
+tar Jc share > $OUT_FILE_BASE.tar.xz
+cd - >/dev/null
+[ -n "${QUIET:-}" ] || cat << EEE
+
+Created $OUT_FILE_BASE.tar.xz
+
+You can install it using:
+  tar Jxf ${OUT_FILE_BASE##*/}.tar.xz -C/opt/ngrest/
+EEE
+EOD
+  trap "" EXIT
+  rm -r $TMP_DIR
+}
+
+deploy() {
+  check_not_mingw
+  SERVER=${1:-}
+  SERVER_PATH=${2:-/opt/ngrest}
+  if [ -z "$SERVER" ]
+  then
+    echo "host parameter is missing" >&2
+    help_deploy
+    exit 1
+  fi
+
+  TMP_DEPLOY_DIR=$(mktemp -d)
+  QUIET=1 bundle $TMP_DEPLOY_DIR/deploy-ngrest-project
+  cd $TMP_DEPLOY_DIR
+  BUNDLE=$OUT_FILE_BASE.tar.xz
+  BUNDLE_CONTENTS=$(base64 -w0 $BUNDLE)
+
+  echo "connecting to $SERVER..."
+  ssh -qt $SERVER /bin/bash << EOF
+set -eu
+echo "Deploying..."
+TMP_DIR=\$(mktemp -d)
+cd \$TMP_DIR
+INSTALLED_VERSION=\$(<$SERVER_PATH/VERSION)
+[ "$NGREST_VERSION" == "\$INSTALLED_VERSION" ] || \
+    echo -e "\e[33;1mWARNING: Server version mismatch! $NGREST_VERSION != \$INSTALLED_VERSION" >&2
+base64 -d <<< "$BUNDLE_CONTENTS" | tar Jx -C $SERVER_PATH
+echo "deploy completed"
+EOF
+  rm -rf $TMP_DEPLOY_DIR
+}
+
+COMMAND=${1:-}
+shift || true
+
+trap : HUP
+
+case $COMMAND in
+  create)
+    create $@
+    ;;
+
+  help)
+    help $@
+    ;;
+
+  add)
+    packages_add $@
+    ;;
+
+  remove)
+    packages_remove $@
+    ;;
+
+  packages)
+    packages_list
+    ;;
+
+  upgrade-package)
+    packages_upgrade $@
+    ;;
+
+  build)
+    build
+    ;;
+
+  run)
+    run
+    ;;
+
+  clean)
+    rm -rf .ngrest/local/*
+    ;;
+
+  upgrade)
+    upgrade
+    ;;
+
+  bundle-server)
+    bundle_server $@
+    ;;
+
+  deploy-server)
+    deploy_server $@
+    ;;
+
+  bundle)
+    bundle $@
+    ;;
+
+  deploy)
+    deploy $@
+    ;;
+
+  "")
+    run
+    ;;
+
+  *)
+    if [ -n "$COMMAND" ]
+    then
+      if [ $ENABLE_EXTENSIONS -eq 1 ]
+      then
+        if [ -n "${extensions[$COMMAND]:-}" ]
+        then
+          $COMMAND $@
+          exit
+        fi
+      fi
+      echo "No such command: $COMMAND"
+    fi
+
+    help
+    ;;
+esac
